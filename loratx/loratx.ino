@@ -22,10 +22,23 @@
 
 #define RADIO_FREQ_MHZ 868
 
+#define D0 16
+#define D1 5
+#define D2 4
+#define D3 0
+#define D4 2
+#define D5 14
+#define D6 12
+#define D7 13
+#define D8 15
+#define RX 3
+#define TX 1
+
 enum RadioAction { RADIO_OFF, RADIO_TX, RADIO_RX };
-enum TimeAwareActions { FUNC_EVERY_SECOND, FUNC_EVERY_100_MSEC };
+enum TimeAwareActions { FUNC_MINUTE, FUNC_SECOND, FUNC_100_MSEC };
 
 void ICACHE_RAM_ATTR setFlag(void);
+void ICACHE_RAM_ATTR D2Read(void);
 
 // RF95 has the following connections:
 // CS pin:    15
@@ -41,6 +54,14 @@ RFM95 radio = new Module(15, 5, 16);
 // save transmission state between loops
 int transmissionState = ERR_NONE;
 uint16_t radioAction = RADIO_OFF;
+uint16_t debounce = 50;
+
+struct INTERRUPTS {
+  bool interruptAttached = false;
+  bool pinState = LOW;
+  bool stateTransmitted = false;
+  bool debounceWait = false;
+} inputInterrupts[3];
 
 void setup() {
   Serial.begin(115200);
@@ -84,7 +105,7 @@ void setup() {
   // when packet transmission is finished
   radio.setDio0Action(setFlag);
   
-  transmissionState = radio.startTransmit("Hello Pet Projects!");
+  transmissionState = radio.startTransmit("System up");
   radioAction = RADIO_TX;
 
   // you can also transmit byte array up to 64 bytes long
@@ -93,6 +114,8 @@ void setup() {
                       0x89, 0xAB, 0xCD, 0xEF};
     state = radio.startTransmit(byteArr, 8);
   */
+
+  pinMode(D2, INPUT_PULLUP);
 }
 
 // flag to indicate that a packet was sent
@@ -123,16 +146,18 @@ void setFlag(void) {
   radioAction = RADIO_OFF;
 }
 
-void sendLoraKeepAlive(void)
+void checkLoraSend(void)
 {
-  // check if the previous transmission finished
-  if(transmittedFlag) {
+  if (transmittedFlag) {
     // disable the interrupt service routine while
     // processing the data
     enableInterrupt = false;
   
     // reset flag
     transmittedFlag = false;
+
+    // Radio is now off
+    radioAction = RADIO_OFF;
   
     if (transmissionState == ERR_NONE) {
       // packet was successfully sent
@@ -145,86 +170,164 @@ void sendLoraKeepAlive(void)
     } else {
       Serial.print(F("failed, code "));
       Serial.println(transmissionState);
-
     }
-  
-    // send another one
-    Serial.print(F("[RFM95] Sending another packet ... "));
-  
-    // you can transmit C-string or Arduino string up to
-    // 256 characters long
-    radioAction = RADIO_TX;
-    transmissionState = radio.startTransmit("Hello World!");
-  
-    // you can also transmit byte array up to 64 bytes long
-    /*
-      byte byteArr[] = {0x01, 0x23, 0x45, 0x67,
-                        0x89, 0xAB, 0xCD, 0xEF};
-      int state = radio.startTransmit(byteArr, 8);
-    */
-
-    // we're ready to send more packets,
+    
+    // we're ready for more packets,
     // enable interrupt service routine
     enableInterrupt = true;
   }
 }
 
-void checkLoraSend(void)
+void checkLoraRecv(void)
 {
-  if(transmittedFlag) {
+  if(receivedFlag) {
     // disable the interrupt service routine while
     // processing the data
     enableInterrupt = false;
-  
+
     // reset flag
-    transmittedFlag = false;
-  
-    if (transmissionState == ERR_NONE) {
-      // packet was successfully sent
-      Serial.println(F("transmission finished!"));
-  
-      // NOTE: when using interrupt-driven transmit method,
-      //       it is not possible to automatically measure
-      //       transmission data rate using getDataRate()
-  
+    receivedFlag = false;
+
+    // you can read received data as an Arduino String
+    String str;
+    int state = radio.readData(str);
+
+    if (state == ERR_NONE) {
+      // packet was successfully received
+      Serial.println(F("[RFM95] Received packet!"));
+
+      // print data of the packet
+      Serial.print(F("[RFM95] Data:\t\t"));
+      Serial.println(str);
+
+      // print RSSI (Received Signal Strength Indicator)
+      // of the last received packet
+      Serial.print(F("[RFM95] RSSI:\t\t"));
+      Serial.print(radio.getRSSI());
+      Serial.println(F(" dBm"));
+
+    } else if (state == ERR_CRC_MISMATCH) {
+      // packet was received, but is malformed
+      Serial.println(F("CRC error!"));
+
     } else {
+      // some other error occurred
       Serial.print(F("failed, code "));
-      Serial.println(transmissionState);
+      Serial.println(state);
+
+    }
+
+    // we're ready for more packets,
+    // enable interrupt service routine
+    enableInterrupt = true;
+  }
+}
+
+bool loraSend(String msg) {
+  if ( radioAction == RADIO_TX ) { // Wait for transmit to complete
+    return false;
+  }
+  
+  Serial.print(F("[RFM95] Sending packet ... "));
+
+  // you can transmit C-string or Arduino string up to
+  // 256 characters long
+  radioAction = RADIO_TX;
+  transmissionState = radio.startTransmit(msg);
+
+  if (transmissionState != ERR_NONE) {
+    Serial.print(F("failed, code "));
+    Serial.println(transmissionState);
+    enableInterrupt = true;
+    return false;
+  }
+    
+  Serial.print("[RFM95] Message sent: " + msg);
+
+  // you can also transmit byte array up to 64 bytes long
+  /*
+    byte byteArr[] = {0x01, 0x23, 0x45, 0x67,
+                      0x89, 0xAB, 0xCD, 0xEF};
+    int state = radio.startTransmit(byteArr, 8);
+  */
+
+  // enable interrupt service routine
+  enableInterrupt = true;
+  return true;
+}
+
+void sendPinState() {
+  uint8_t i = 0;
+  for ( i = 0; i < 3; i++ ) {
+    if ( inputInterrupts[i].interruptAttached && !inputInterrupts[i].stateTransmitted && loraSend((String) "Pin" + i + "State" + inputInterrupts[i].pinState)) {
+      inputInterrupts[i].stateTransmitted = true;
     }
   }
 }
 
-void checkLoraRecv(void)
-{
-  
-}
-
 void timeLoop(uint8_t action)
 {
-  switch action {
-    case FUNC_EVERY_SECOND:
-      sendLoraKeepAlive();
+  switch (action) {
+    case FUNC_MINUTE:
+      loraSend("SYN");
+      break;    
+    case FUNC_SECOND:
       break;
-    case FUNC_EVENT_100_MSEC:
+    case FUNC_100_MSEC:
       checkLoraSend();
       checkLoraRecv();
+      if(inputInterrupts[0].debounceWait) {
+        D2Read();
+      }
+      sendPinState();
       break;
   }
+}
+
+void D2Read(void) {
+  static bool lastState = LOW;
+  static uint32_t lastDebounceTime = millis();
+
+  bool pinState = digitalRead(D2);
+
+  if (pinState != lastState) {
+    lastDebounceTime = millis();
+    inputInterrupts[0].debounceWait = true;
+  }
+  
+  if ((millis() - lastDebounceTime) > debounce) {
+    if (pinState != inputInterrupts[0].pinState) {
+      inputInterrupts[0].pinState = pinState;
+      inputInterrupts[0].stateTransmitted = false;
+      inputInterrupts[0].debounceWait = false;
+    }
+  }
+  lastState = pinState;
 }
 
 void loop() {
+  static uint32_t state_minute = 0;                // State minute timer
   static uint32_t state_second = 0;                // State second timer
   static uint32_t state_100_msec = 0;              // State 100 msec timer
-  if(false == enableInterrupt && radioAction == RADIO_OFF) { // We are not waiting for anything so lets listen for packets
+  if (radioAction == RADIO_OFF) {                  // We are not waiting for anything so lets listen for packets
     radioAction = RADIO_RX;
     radio.startReceive();
   }
+  if (!inputInterrupts[0].interruptAttached) {
+    inputInterrupts[0].interruptAttached = true;
+    attachInterrupt(digitalPinToInterrupt(D2), D2Read, CHANGE);
+  }
+  
+  if (TimeReached(state_minute)) {
+    SetNextTimeInterval(state_minute, 60000);
+    timeLoop(FUNC_MINUTE);
+  }
   if (TimeReached(state_second)) {
     SetNextTimeInterval(state_second, 1000);
-    timeLoop(FUNC_EVERY_SECOND);
+    timeLoop(FUNC_SECOND);
   }
-  if (TimeReaced(state_100_msec)) {
+  if (TimeReached(state_100_msec)) {
     SetNextTimeInterval(state_100_msec, 100);
-    timeLoop(FUNC_EVERY_100_MSEC);
+    timeLoop(FUNC_100_MSEC);
   }
 }
